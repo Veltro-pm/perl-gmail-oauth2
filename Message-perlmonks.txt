@@ -1,0 +1,699 @@
+<p>Hello,</p>
+<p>I wrote a program containing two methods regards sending a simple email with Gmail with OAuth 2 authorization. Method 1 uses Gmail SMTP server and Method 2 uses Gmail API. I wrote all my notes inside of the program so please read those first, especially the security consideration section. There are a few steps required to get this working which have been described in the main program.</p> 
+<p>I hope the programs will be usefull to you,</p>
+<p>With best regards, Veltro</p>
+<p>The first method needs a mechanism to authenticate, I have written the following module for that, that you must place in .\Authen\SASL\Perl\XOAUTH2.pm</p>
+<c>
+#!/usr/bin/perl
+# Copyright (c) 2018 Veltro. All rights reserved.
+# This program is free software; you can redistribute it and/or
+# modify it under the same terms as Perl itself.
+#
+# This package is provided "as is" and without any express or implied
+# warranties, including, without limitation, the implied warranties of
+# merchantability and fitness for a particular purpose
+#
+# Description:
+# Part of SASL authentication mechanism for OAuth 2.0 (RFC 6749)
+# This package contains the method to create the initial client
+# response according to the format specified in:
+# https://developers.google.com/gmail/imap/xoauth2-protocol
+
+package Authen::SASL::Perl::XOAUTH2 ;
+
+use strict ;
+use warnings ;
+
+our $VERSION = "0.01c" ;
+our @ISA = qw( Authen::SASL::Perl ) ;
+
+my %secflags = ( ) ;
+
+sub _order { 1 }
+
+sub _secflags {
+  shift ;
+  scalar grep { $secflags{$_} } @_ ;
+}
+
+sub mechanism {
+	# SMTP->auth may call mechanism again with arg $mechanisms
+	#            but that means something is not right
+	if ( defined $_[1] ) { die "XOAUTH2 not supported by host\n" } ;
+	return 'XOAUTH2' ;
+} ;
+
+my @tokens = qw( user auth access_token ) ;
+
+sub client_start {
+	# Create authorization string:
+	# "user=" {User} "^Aauth=Bearer " {Access Token} "^A^A"
+	my $self = shift ;
+	$self->{ error } = undef ;
+	$self->{ need_step } = 0 ;
+	return
+		'user=' .
+		$self->_call( $tokens[0] ) .
+		"\001auth=" .
+		$self->_call( $tokens[1] ) .
+		" " .
+		$self->_call( $tokens[2] ) .
+		"\001\001" ;
+}
+
+1 ;
+</c>
+<p>The program uses a template that needs to be put here .\templates\test.txt.tt</p>
+<c>
+Hi [% first_name %],
+
+This is a test message from your Perl program!
+
+Japh,
+</c>
+<p>The program requires two modules that needs to put in the same folder as your script: .\ClientSecret.pm and .\ClientCredentials.pm</p>
+<c>
+#!/usr/bin/perl
+# Copyright (c) 2018 Veltro. All rights reserved.
+# This program is free software; you can redistribute it and/or
+# modify it under the same terms as Perl itself.
+#
+# This package is provided "as is" and without any express or implied
+# warranties, including, without limitation, the implied warranties of
+# merchantability and fitness for a particular purpose
+#
+# Description:
+# Helper package to read the client secrets json file
+
+package ClientSecret ;
+
+use strict ;
+use warnings ;
+use JSON qw( decode_json ) ;
+
+sub new {
+	my $class = shift ;
+	my $fp = shift ; # Full Path to json secret file or undef
+                     # If undef, then each parameter needs
+                     # to be specified manually in params
+	my ( %params ) = @_ ; # undef or overwrite all default
+                          # json attributes
+	my $this = {
+		clientID => 'installed/client_id',
+		projectId => 'installed/project_id',
+		authUri => 'installed/auth_uri',
+		tokenUri => 'installed/token_uri',
+		authProviderX509CertUrl => 'installed/auth_provider_x509_cert_url',
+		clientSecret => 'installed/client_secret',
+		redirectUris => 'installed/redirect_uris'
+	} ;
+	if ( %params ) {
+		@{$this}{keys %params} = @params{keys %params} ;
+	}
+	bless $this, $class ;
+	if ( defined $fp ) {
+		if ( $this->readJson( $fp ) ) {
+			return $this ;
+		}
+	}
+	return 0 ;
+}
+
+sub readJson {
+	my $this = shift ;
+	my $fp = shift ;
+	my $fh ;
+	if ( !open $fh, "<", $fp ) {
+		warn "Could not open $fp\n" ;
+		return 0 ;
+	}
+	my $json = '' ;
+	while( <$fh> ) {
+		chomp ;
+		$json = $json . $_ ;
+	}
+	close $fh ;
+	my $decoded_json = decode_json( $json ) ;
+	foreach ( keys %{$this} ) {
+		my @nodes = split /\//, $this->{ $_ } ;
+		$this->{ $_ } = $decoded_json->{ shift @nodes } ;
+		while ( @nodes ) {
+			$this->{ $_ } = $this->{ $_ }->{ shift @nodes } ;
+		}
+	}
+	return ( defined $this->{ clientID } && defined $this->{ clientSecret } ) ;
+}
+
+1 ;
+</c>
+<c>
+#!/usr/bin/perl
+# Copyright (c) 2018 Veltro. All rights reserved.
+# This program is free software; you can redistribute it and/or
+# modify it under the same terms as Perl itself.
+#
+# This package is provided "as is" and without any express or implied
+# warranties, including, without limitation, the implied warranties of
+# merchantability and fitness for a particular purpose
+#
+# Description:
+# Helper package to store the client credentials
+# in a JSON file (both refresh token and access token)
+# and to be able to determine if the refresh token is
+# available and the access token is still valid. 
+
+package ClientCredentials ;
+
+use strict ;
+use warnings ;
+use JSON qw( decode_json encode_json -convert_blessed_universally ) ;
+
+sub new {
+	my $class = shift ;
+	my $fp = shift ; # Full Path to JSON credentials file
+	                 # (or the file that needs to be created)
+	my $this = {
+		_filePath => $fp,
+		accessToken => undef,
+		expiresIn => undef,
+		time => undef,
+		refreshToken => undef,
+		tokenType => undef
+	} ;
+	bless $this, $class ;
+	if ( defined $fp ) {
+		if ( -f $fp ) {
+			$this->readJson( $fp ) ;
+			if ( $this->expired ) {
+				$this->{ accessToken } = undef ;
+				$this->{ expiresIn } = undef ;
+				$this->{ time } = undef ;
+				$this->{ tokenType } = undef ;
+			}
+		}
+	}
+	return $this ;
+}
+
+sub refreshTokenNeeded {
+	my $this = shift ;
+	return 1 unless ( defined $this->{ refreshToken } ) ;
+	return 0 ;
+}
+
+sub expired {
+	my $this = shift ;
+	return 1 unless ( defined $this->{ accessToken } && defined $this->{ expiresIn } && defined $this->{ time } ) ;
+	return time > ( $this->{ time } + $this->{ expiresIn } - 300 ) ? 1 : 0 ;
+}
+
+sub setRefreshToken {
+	my $this = shift ;
+	my $refreshToken = shift ;
+	$this->{ refreshToken } = $refreshToken ;
+	$this->{ accessToken } = undef ;
+	$this->{ expiresIn } = undef ;
+	$this->{ time } = undef ;
+	$this->{ tokenType } = undef ;
+	$this->writeJson() ;
+}
+
+sub setAccessToken {
+	my $this = shift ;
+	my $accessToken = shift ;
+	my $expiresIn = shift ;
+	my $tokenType = shift ;
+	my $time = time ;
+	$this->{ accessToken } = $accessToken ;
+	$this->{ expiresIn } = $expiresIn ;
+	$this->{ time } = $time ;
+	$this->{ tokenType } = $tokenType ;
+	$this->writeJson() ;
+}
+
+sub readJson {
+	my $this = shift ;
+	my $fp = shift ;
+	my $fh ;
+	if ( !open $fh, "<", $fp ) {
+		warn "Could not open $fp\n" ;
+		return ;
+	} ;
+	my $json = '' ;
+	while( <$fh> ) {
+		chomp ;
+		$json = $json . $_ ;
+	}
+	close $fh ;
+	my $decoded_json = decode_json( $json ) ;
+	foreach ( keys %{$this} ) {
+		if( $_ =~ /^[^_].*/ ) {
+			$this->{ $_ } = $decoded_json->{ $_ } ;
+		}
+	}
+}
+
+sub writeJson {
+	my $this = shift ;
+	my $json = JSON->new->allow_nonref->convert_blessed ;
+	my $encoded_json = $json->encode( $this ) ;
+	my $fh ;
+	if ( !open $fh, ">", $this->{ _filePath } ) {
+		warn "Write failed to $this->{ _filePath }\n" ;
+		return ;
+	} ;
+	print $fh $encoded_json ;
+	close $fh ;
+}
+
+1 ;
+</c>
+<p>And here is the program:</p>
+<c>#!/usr/bin/perl
+# Copyright (c) 2018 Veltro. All rights reserved.
+# This program is free software; you can redistribute it and/or
+# modify it under the same terms as Perl itself.
+#
+# This package is provided "as is" and without any express or implied
+# warranties, including, without limitation, the implied warranties of
+# merchantability and fitness for a particular purpose
+#
+# Description:
+# This program contains TWO examples which can be switched by setting
+# the internal $method variable to 1 or 2.
+# This program was shared by me at PerlMonks:
+# https://www.perlmonks.org/?node_id=1218405
+#
+# Example 1:
+# Example program that sends an email from your Gmail account using
+# the Gmail SMTP OAuth 2.0 authenticated Server over TLS 
+#
+# Example 2:
+# Example program that sends an email from your Gmail account using
+# the Gmail API with OAuth 2.0 authentication
+#
+# For both examples it is not needed to
+# - use your Google account password
+# - to enable 'less secure apps' for Gmail
+# (Since they use a different authorization mechanism).
+#
+# This program has been tested under Windows 10 and Strawberry Perl:
+# perl 5, version 26, subversion 2 (v5.26.2) built for
+# MSWin32-x64-multi-thread.
+#
+# Preface: After reading a couple of Perl examples that make it
+# possible to send emails using the Gmail SMTP server I didn't
+# like the fact that these programs often require user name and
+# passwords of my Google account. So I started to wonder, is there a
+# better way? Most of the alternatives that I found where written in
+# different programming languages such as Python, Java and more.
+# After doing some research I found out about the possibility to use a
+# Oauth 2.0 authenticated SMTP server, and I thought I could
+# potentially turn this into a working Perl program easily. So I
+# started programming but I found that it was a bit more difficult
+# than I thought it would be. While programming and getting more
+# familiar on the subject I also started to realize that using the
+# Google Gmail API could also be a useful method because it has better
+# possibilities when using scopes. (The first method can only use one
+# scope with full access to Gmail: https://mail.google.com/).
+# So I tried using the API as as well and this resulted in the second
+# example. Both methods work, but each has it's advantages and
+# disadvantages. I decided to post both examples on PerlMonks with
+# this program since I think both methods have some useful elements
+# that people may want to learn from. I have tried to keep the program
+# simple and pretty low level on purpose so that it easier to see
+# what is happening 'under the hood'. The next thing that would
+# probably be nice to have is sending more complex messages (HTML
+# format body and messages with attachments).
+#
+# Security considerations:
+# Using OAuth 2.0 authentication in my opinion looks like a better 
+# method than using your Google account password written out
+# fully inside a program to access the Gmail SMTP server. Your
+# user name and password would give full access to your Google account
+# and when compromised would allow your password to be changed.
+# However, on the subject of using OAuth 2.0 authentication and Google
+# API's, Google has warnings in multiple occasions like:
+# - Warning: Keep your client secret private. If someone obtains your
+#   client secret, they could use it to consume your quota, incur
+#   charges against your Google APIs Console project, and request
+#   access to user data.
+# - Warning: Keep your API key private. If someone obtains your key,
+#   they could use it to consume your quota or incur charges against
+#   your API Console project.
+# - Warning: Keep refresh and access tokens private. If someone
+#   obtains your tokens, they could use them to access private user
+#   data.
+# Simply put I think this means: If you feel that the security of your
+# credentials (in this case the JSON files that contain your secrets,
+# access tokens and the refresh token) may be compromised, then don't
+# use these methods!
+#
+# When you use the method from example 1,
+# https://myaccount.google.com/permissions will show:
+#    <Product Name> Has access to:
+#       Gmail
+#       Read, send, delete, and manage your email 
+# So the method used by this program results in full access to Gmail
+# and not "Full account access".
+# (See also: https://support.google.com/accounts/answer/3466521).
+#
+# For the second method scopes can be altered. See the notes in the
+# subroutine: getAuthorizationUrlGmail and the difference of the 
+# $scope variable in the program.
+# When you use the method 2,
+# https://myaccount.google.com/permissions will show:
+#    <Product Name> Has access to:
+#       Gmail
+#       Send email on your behalf
+#
+# Additionally, in my opinion there is one serious flaw in Google's
+# security system that needs to be considered before using the first
+# method this program uses.
+# The method acquires a refresh token to use SMTP that has the scope:
+# https://mail.google.com/. And it is not possible to use 'incremental
+# authorization' as in method 2. The scope allows full access to your
+# Gmail: Read, send, delete, and manage your email. Now here is the
+# problem: The same refresh token can be used to allow access to Gmail
+# through other applications interacting with Google's OAuth 2.0
+# endpoints. It seems there is no possibility to set boundaries that
+# tells Google to use the credentials for SMTP only (except for maybe
+# not enabling the Gmail API)! And as far as I'm concerned this and
+# the fact that no other scopes (with lower security levels) can be
+# used this just totally sucks and it is better to take the warnings
+# from the Google documentation extra serious.
+#
+# How to get this program working:
+#
+# Prerequisites:
+# - Packages: JSON, MIME::Lite::TT, Net::SMTP, URL::Encode,
+#   LWP::UserAgent, HTTP::Request::Common
+# The program comes accompanied with the following modules: 
+# - package Authen::SASL::Perl::XOAUTH2
+#   To make it possible using Net::SMTP auth() method
+#   location: .\Authen\SASL\Perl\XOAUTH2.pm
+# - package ClientSecret ;
+#   A very basic JSON reader that can read the JSON client-secret
+#   downloaded from Google
+#   location: .\ClientSecret.pm
+# - package ClientCredentials
+#   A very basic JSON storage that can read and write the acquired
+#   credentials from and back to disc
+#   location: .\ClientCredentials.pm
+#
+# Steps needed for Gmail OAuth 2.0 authentication:
+# -  You need a Google account for these steps
+# 1. Create a project at Google (https://console.cloud.google.com)
+# 2. Select your project from the Dashboard and go to 'Credentials'
+# 3. Select the tab: OAuth consent screen.
+#    The minimum requirement is that you define the product name
+#    So give it the name 'Perl mail' or something like that
+# 4. Select the credentials tab and click on the 'Create credentials'
+#    button and select: 'OAuth client ID'
+# 5. Under Application type select: 'other'
+# 6. Specify the name for the client id. (E.g. 'GmailPerlClientID' ) 
+# 7. Download the client-secret JSON file
+# 8. (Method 2 only): Activate the Gmail API (and revoke the rights
+#    that you gave to method 1, see security considerations for why).
+#
+# Steps needed for this program:
+# 1. Now that you have downloaded the JSON file, Change the line
+#    'new $cs ...' and fill in the path to the JSON file
+#    (Note: the JSON file contains redirect uri's, it may be needed
+#           to change the order in which they appear, first the urn
+#           then the one to localhost)
+# 2. Do the same for 'new $cred ...', and enter a full path to a JSON
+#    file where the credentials are going to be stored.
+# 3. Execute this program, use the link that is given to you
+#    with a Internet browser and follow the steps to get the
+#    authentication code.
+# 4. Once you have acquired the authentication code, change the line:
+#    my $authorizationCode = 'Fill in your authorization code here' 
+# 5. Change the following lines with your email address
+#    my $userAuth = 'your email address here' ;
+#    my $to = 'your email address here' ;
+# 6. Execute this program again.
+#    The program will try to create a new file (step 2) to store the
+#    credentials such as access tokens and refresh tokens. Make sure
+#    that the program can write to this location or it may fail.
+# 7. You've Got Mail!
+#
+# Note: The refresh token may become invalid in certain cases. It
+# may expire (after 6 months) or it becomes invalid after changing
+# your password.
+#
+# Note: In case you need to create a new authorization code
+# Set $authorizationCode to '' and delete the client_credentials file
+#
+use lib '.' ;
+
+use strict ;
+use warnings ;
+use ClientSecret ;
+use ClientCredentials ;
+use MIME::Lite::TT ;
+use Net::SMTP ;
+use URL::Encode qw(url_encode) ;
+use LWP::UserAgent ;
+use HTTP::Request::Common ;
+use JSON ;
+use MIME::Base64 ;
+use Data::Dumper ;
+
+# Activate this line to debug SSL:
+# use IO::Socket::SSL qw(debug4);
+
+# Set this to 1 to debug SMTP:
+my $dbgSMTP = 0 ;
+
+my $method = 1 ;
+
+my $userAuth = 'Your Gmail address here' ;
+my $to = 'Your Gmail address here' ;
+my $from = 'me' ;
+
+# Download Google OAuth 2.0 client secret JSON file and fill in the
+# full path here;
+my $cs = new ClientSecret( q{.\client_secret_xxxxxxxxxxxxx-xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx.apps.googleusercontent.com.json}) ;
+die "Failed to read client secret\n" unless ( $cs ) ;
+
+# Specify the full path to credentials storage location here (.json):
+my $cred = new ClientCredentials( q{.\client_credentials_xxxxxxxxxxxxx-xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx.apps.googleusercontent.com.json}) ;
+
+# Fill in your authorization code here
+my $authorizationCode =
+	'Fill in your authorization code here' ;
+
+# Get the refresh token if needed
+if ( $cred->refreshTokenNeeded ) {
+	if ( $authorizationCode eq
+			'Fill in your authorization code here' ||
+		 $authorizationCode eq ''
+	) {
+		# Authorization code needed. Follow link, accept and copy the
+		# authorization code to this program in $authorizationCode
+		my $scope = 'https://mail.google.com/' ;
+		if ( $method == 2 ) {
+			$scope = 'https://www.googleapis.com/auth/gmail.send' ;
+		#	$scope = 'https://www.googleapis.com/auth/gmail.insert' ;
+		}
+		my $aUrl = getAuthorizationUrlGmail( $cs, $scope ) ;
+		print "Get your authorization code here:\n" . $aUrl . "\n\n" ;
+		print "Change \$authorizationCode to the acquired code from Google\n" ;
+		exit( 0 ) ;
+	} else {
+		# Get the refresh token (and access token)
+		getRefreshToken( $cs, $cred, $authorizationCode ) ;
+	}
+}
+
+# Check if a refresh is needed
+if ( $cred->expired ) {
+	refresh( $cs, $cred ) ;
+}
+
+sub getAuthorizationUrlGmail {
+	# IN: ClientSecret object
+	# IN: scope (See:
+	# 	  https://developers.google.com/gmail/api/auth/scopes)
+	# OUT: URL to insert into your browser to retrieve the
+	#      authorization code
+	my $cs = shift ;
+	my $scope = shift ;
+	my $url = "$cs->{ authUri }?" .
+		"client_id=" . url_encode( $cs->{ clientID } ) .
+		"&redirect_uri=" . url_encode( $cs->{ redirectUris }[0] ) .
+		"&scope=" . url_encode( $scope ) .
+		"&response_type=code" ;
+	return $url ;
+}
+
+sub getRefreshToken {
+	my $cs = shift ;
+	my $cred = shift ;
+	my $authorizationCode = shift ;
+	my $url = $cs->{ tokenUri } ;
+	my $ua = LWP::UserAgent->new ;
+	my $response = $ua->request( POST $url, [
+		client_id => $cs->{ clientID },
+		client_secret => $cs->{ clientSecret },
+		code => $authorizationCode,
+		# Redirect to urn, (takes first urn in JSON)
+		redirect_uri => $cs->{ redirectUris }[0],
+		grant_type => 'authorization_code'
+	] ) ;
+	my $decoded_json = decode_json($response->decoded_content);
+	my $accessToken = $decoded_json->{ 'access_token' } ;
+	my $expiresIn = $decoded_json->{ 'expires_in' } ;
+	my $refreshToken = $decoded_json->{ 'refresh_token' } ;
+	my $tokenType = $decoded_json->{ 'token_type' } ;
+	$cred->setRefreshToken( $refreshToken ) ;
+	$cred->setAccessToken( $accessToken, $expiresIn, $tokenType ) ;
+}
+
+sub refresh {
+	my $cs = shift ;
+	my $cred = shift ;
+	my $url = $cs->{ tokenUri } ;
+	my $ua = LWP::UserAgent->new ;
+	my $response = $ua->request( POST $url, [
+		client_id => $cs->{ clientID },
+		client_secret => $cs->{ clientSecret },
+		refresh_token => $cred->{ refreshToken },
+		grant_type => 'refresh_token'
+	] ) ;
+	my $decoded_json = decode_json($response->decoded_content);
+	my $accessToken = $decoded_json->{ 'access_token' } ;
+	my $tokenType = $decoded_json->{ 'token_type' } ;
+	my $expiresIn = $decoded_json->{ 'expires_in' } ;
+	$cred->setAccessToken( $accessToken, $expiresIn, $tokenType ) ;
+}
+
+# Create MIME::Lite::TT email message
+
+my %params ;
+$params{first_name} = 'Veltro' ;
+
+my %options ;
+$options{INCLUDE_PATH} = './templates' ;
+
+my $msg = MIME::Lite::TT->new(
+	# From/to may not be used, but then only BCC will be filled in
+	# instead. Using from/to here then Gmail finds my email
+	# 'important' according to the magical formulas of Google.
+	From => $from,
+	To => $to,
+	Subject => 'Test email from Perl',
+	Template => 'test.txt.tt',
+	TmplOptions => \%options,
+	TmplParams => \%params,
+) ;
+
+######################## METHOD 1 ####################################
+if ( $method == 1 ) {
+
+	# use NET::SMTP instead of $msg->send:
+	# - Gmail = smtp.gmail.com
+	# - Port 465 = SSL, is also ok, but then do not starttls and set
+	#   initial connection with option 'SSL => 1'
+	# - Port 587 = TLS
+	my $smtp = Net::SMTP->new( 'smtp.gmail.com', Port=>587,
+		SendHello => 0, Debug => $dbgSMTP
+	) ;
+	if ( !( defined $smtp ) ) {
+		print "Failed to connect, reason=$@\n" ;
+		exit( 1 ) ;
+	}
+
+	# HELLO
+	# Reminder: hello is also send again after starttls
+	$smtp->hello( $cs->{ clientID } )
+		or die "Error: " . $smtp->message() ;
+
+	# STARTTLS
+	if ( !$smtp->starttls() ) {
+		if ( ref $smtp eq 'Net::SMTP' ) {
+			die "NET::SMPT failed to upgrade connection after connection message: " .
+			$smtp->message() .
+			"Possible reasons for this may be firewalls or antivirus protection software (such as mail shields). You can activate debugging for IO::Socket::SSL and \$dbgSMTP to search for other possible reasons\n" ;
+		} else {
+			die "starttls failed with Error: " . $smtp->message() .
+			"You can activate debugging for IO::Socket::SSL and \$dbgSMTP to search for possible reasons\n" ;
+		}
+	} ;
+
+	# AUTHENTICATE
+	use Authen::SASL qw( Perl ) ;
+	my $sasl = Authen::SASL->new(
+		mechanism => 'XOAUTH2',
+		callback => {
+			user => $userAuth,
+			auth => $cred->{ tokenType },
+			access_token => $cred->{ accessToken },
+		}
+	) ;
+	$smtp->auth($sasl) or die "Can't authenticate:" . $smtp->message() ;
+	# ($smtp->message)[0] should contain something like: 2.7.0 Accepted
+
+	# MAIL (= From)
+	$smtp->mail( $from )
+		or die "Error: " . $smtp->message() ;
+
+	# TO
+	$smtp->to( $to )
+		or die "Error: " . $smtp->message() ;
+
+	# DATA - DATASEND - DATAEND - QUIT
+	$smtp->data() or die "Error: " . $smtp->message() ;
+	$smtp->datasend( $msg->as_string )
+		or die "Error: " . $smtp->message() ;
+	$smtp->dataend() or die "Error: " . $smtp->message() ;
+	$smtp->quit() or die "Error: " . $smtp->message() ;
+
+	if($@) {
+		print STDERR "Error sending mail: $@";
+	}
+}
+
+######################## METHOD 2 ####################################
+if ( $method == 2 ) {
+	my $msg64 = encode_base64( $msg->as_string, '' ) ;
+
+	my %jsonraw = ( raw => $msg64 ) ;
+
+	use LWP::Protocol::http ;
+	push( @LWP::Protocol::http::EXTRA_SOCK_OPTS,
+		PeerHTTPVersion => 1.1
+	) ;
+	my $ua = LWP::UserAgent->new( keep_alive => 1, send_te => 0 ) ;
+	my @ns_headers = (
+		'Connection' => 'Keep-Alive',
+		'Content-Type' => 'application/json',
+		'Authorization' => "Bearer $cred->{ accessToken }",
+	) ;
+
+	# scope could be : https://mail.google.com
+	#      or better : https://www.googleapis.com/auth/gmail.send
+	my $uri = 'https://content.googleapis.com/gmail/v1/users/me/messages/send' ;
+
+	# scope could be: 'https://www.googleapis.com/auth/gmail.insert'
+	# my $uri = 'https://content.googleapis.com/gmail/v1/users/me/messages' ;
+	# Not so useful, message is created but does not appear in Inbox
+	
+	my $json = JSON->new ;
+	my $encoded_json = $json->encode( \%jsonraw ) ;
+
+	my $req = HTTP::Request->new( 'POST', $uri ) ;
+	$req->header( @ns_headers ) ;
+	$req->content( $encoded_json ) ;
+
+	my $response = $ua->request( $req ) ;
+	# This also works but I prefer a cleaner header
+	# my $lwp = LWP::UserAgent->new ;
+	# $lwp->request( $req ) ;
+
+	# Enable this for debugging. The API sometimes shows pretty
+	# useful error messages
+	# print Dumper( $response ) ;
+}
+</c>
